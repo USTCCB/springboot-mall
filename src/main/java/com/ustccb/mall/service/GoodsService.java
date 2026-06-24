@@ -1,7 +1,8 @@
 package com.ustccb.mall.service;
 
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.ustccb.mall.annotation.ReadOnly;
 import com.ustccb.mall.entity.Goods;
 import com.ustccb.mall.mapper.GoodsMapper;
 import lombok.RequiredArgsConstructor;
@@ -17,11 +18,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 商品服务：Cache Aside 缓存模式
- * <pre>
- *   - 读防线：Redis 命中 -> 返回；MISS -> 抢分布式锁（防击穿） -> 二重检查缓存 -> 查 DB -> 正常写缓存/存空标记（防穿透） -> 释锁
- *   - 写防线：先写 DB，再 DEL Redis，保证强一致性
- * </pre>
+ * 商品服务：多级缓存 (Caffeine 一级 + Redis 二级) + 读写分离架构
  */
 @Slf4j
 @Service
@@ -31,61 +28,96 @@ public class GoodsService {
     private static final String CACHE_KEY_PREFIX = "mall:goods:";
     private static final Duration CACHE_TTL = Duration.ofMinutes(5);
 
+    // 本地多级缓存穿透防护空标记对象
+    private static final Goods EMPTY_GOODS = new Goods();
+    static {
+        EMPTY_GOODS.setId(-1L);
+    }
+
     private final GoodsMapper goodsMapper;
     private final StringRedisTemplate redis;
     private final ObjectMapper objectMapper;
     private final RedissonClient redisson;
+    private final Cache<Long, Goods> goodsLocalCache; // 注入一级的 Caffeine 本地缓存
 
+    /**
+     * 商品列表：查询操作路由至只读从数据库 (slave)
+     */
+    @ReadOnly
     public List<Goods> list() {
         return goodsMapper.findAll();
     }
 
     /**
-     * 查询商品详情：带高防卫能力的 Cache Aside 读路径
+     * 查询商品详情：多级缓存级联读取通道
      */
+    @ReadOnly // 读操作路由到只读从库
     public Goods get(Long id) {
         String key = CACHE_KEY_PREFIX + id;
-        
-        // 1) 读缓存：快速通道
+
+        // 1) 读一级本地缓存 (Caffeine)：极速响应，抗极高吞吐量
+        Goods localGoods = goodsLocalCache.getIfPresent(id);
+        if (localGoods != null) {
+            if (EMPTY_GOODS.getId().equals(localGoods.getId())) {
+                log.debug("[Caffeine] 命中本地空值防护，直接返回 null. id={}", id);
+                return null;
+            }
+            log.debug("[Caffeine] 一级本地缓存命中. id={}", id);
+            return localGoods;
+        }
+
+        // 2) 读二级分布式缓存 (Redis)：分布式共享
         String json = redis.opsForValue().get(key);
         if (json != null) {
             if ("{}".equals(json)) {
-                log.debug("商品缓存命中空值(防缓存穿透) id={}", id);
+                log.debug("[Redis] 二级缓存命中空值，填充一级本地并返回 null. id={}", id);
+                goodsLocalCache.put(id, EMPTY_GOODS);
                 return null;
             }
             try {
-                log.debug("商品缓存命中 id={}", id);
-                return objectMapper.readValue(json, Goods.class);
+                Goods g = objectMapper.readValue(json, Goods.class);
+                log.debug("[Redis] 二级分布式缓存命中. id={}", id);
+                // 填充一级缓存，保证下次请求直接走 Caffeine
+                goodsLocalCache.put(id, g);
+                return g;
             } catch (Exception e) {
-                log.warn("反序列化缓存失败，降级到 DB: {}", e.getMessage());
+                log.warn("二级缓存解析失败，降级处理: {}", e.getMessage());
             }
         }
 
-        // 2) 缓存失效：获取互斥锁防缓存击穿
+        // 3) 缓存击穿防护：获取分布式互斥锁并执行 DCL（双重校验锁）
         String lockKey = CACHE_KEY_PREFIX + "lock:" + id;
         RLock lock = redisson.getLock(lockKey);
         try {
-            // 尝试获取锁，等待时间 2 秒，占锁 5 秒
             boolean locked = lock.tryLock(2, 5, TimeUnit.SECONDS);
             if (locked) {
                 try {
-                    // Double Check (二重检查)：获取到锁之后，再次查缓存，防止等待时别的线程已经将数据写入缓存
+                    // Double Check：获取锁后再次检查本地和 Redis 缓存，防高并发下排队等待释放后重复查询 DB
+                    localGoods = goodsLocalCache.getIfPresent(id);
+                    if (localGoods != null) {
+                        return EMPTY_GOODS.getId().equals(localGoods.getId()) ? null : localGoods;
+                    }
                     json = redis.opsForValue().get(key);
                     if (json != null) {
                         if ("{}".equals(json)) {
+                            goodsLocalCache.put(id, EMPTY_GOODS);
                             return null;
                         }
-                        return objectMapper.readValue(json, Goods.class);
+                        Goods g = objectMapper.readValue(json, Goods.class);
+                        goodsLocalCache.put(id, g);
+                        return g;
                     }
 
-                    // 查 DB
+                    // 4) 最终路由从库查询 DB
                     Goods g = goodsMapper.findById(id);
                     if (g != null) {
-                        // 查到数据：回写缓存，设置 5 分钟 TTL
+                        log.info("[DB] 缓存未命中，查询从库成功并写回多级缓存. id={}", id);
                         redis.opsForValue().set(key, objectMapper.writeValueAsString(g), CACHE_TTL);
+                        goodsLocalCache.put(id, g);
                     } else {
-                        // DB 无此数据：缓存空对象（如 "{}"），TTL设为 60 秒，有效防缓存穿透
+                        log.warn("[DB] 查询从库发现商品不存在，回写空标记防穿透. id={}", id);
                         redis.opsForValue().set(key, "{}", Duration.ofSeconds(60));
+                        goodsLocalCache.put(id, EMPTY_GOODS);
                     }
                     return g;
                 } finally {
@@ -94,32 +126,30 @@ public class GoodsService {
                     }
                 }
             } else {
-                // 未抢到锁的线程进行休眠重试，防止将压力全部打进 DB
-                log.debug("未获取到防击穿锁，休眠后重试 id={}", id);
+                // 没抢到锁的线程休眠后重试，此时获取到锁的线程应该已经写好了缓存
                 Thread.sleep(100);
-                return get(id); // 递归重试，此时缓存已被抢到锁的线程填充完毕，能直接命中快速通道
+                return get(id);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            log.warn("防击穿获取锁被中断，直接降级查 DB id={}", id);
             return goodsMapper.findById(id);
         } catch (Exception e) {
-            log.error("防击穿查询出现异常，降级直连 DB id={}", id, e);
+            log.error("多级缓存击穿防护交易异常，降级直连从库 DB. id={}", id, e);
             return goodsMapper.findById(id);
         }
     }
 
     /**
-     * 更新商品：先写 DB，再清缓存（Cache Aside 写路径）
+     * 更新商品：写操作直接路由到主数据库 (master)
      */
     @Transactional
     public Goods update(Long id, Goods g) {
         g.setId(id);
         goodsMapper.update(g);
-        // DEL 而非 SET，避免并发写覆盖
+        // 双删/单删：Cache Aside 写路径，失效缓存，保持强一致
         redis.delete(CACHE_KEY_PREFIX + id);
-        log.info("更新商品并清缓存 id={}", id);
+        goodsLocalCache.invalidate(id); // 同时使一级本地缓存失效
+        log.info("[DB] 更新主库并使多级缓存失效 id={}", id);
         return goodsMapper.findById(id);
     }
 }
-

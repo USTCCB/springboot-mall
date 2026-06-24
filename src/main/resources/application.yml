@@ -4,10 +4,16 @@ spring:
   application:
     name: springboot-mall
   datasource:
-    url: jdbc:h2:mem:mall;DB_CLOSE_DELAY=-1;MODE=MySQL
-    driver-class-name: org.h2.Driver
-    username: sa
-    password:
+    master:
+      jdbc-url: jdbc:h2:mem:mall_master;DB_CLOSE_DELAY=-1;MODE=MySQL
+      driver-class-name: org.h2.Driver
+      username: sa
+      password:
+    slave:
+      jdbc-url: jdbc:h2:mem:mall_slave;DB_CLOSE_DELAY=-1;MODE=MySQL
+      driver-class-name: org.h2.Driver
+      username: sa
+      password:
   h2:
     console:
       enabled: true
@@ -16,9 +22,22 @@ spring:
       host: localhost
       port: 6379
       timeout: 1000ms
-mybatis:
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    listener:
+      simple:
+        acknowledge-mode: manual # 开启手动应答
+        prefetch: 1 # 限制预取数量，保障消费公平与防堆积
+mybatis-plus:
   mapper-locations: classpath:mapper/*.xml
   type-aliases-package: com.ustccb.mall.entity
+  global-config:
+    db-config:
+      id-type: assign_id # 主键策略：雪花算法
+
 
 # SpringDoc OpenAPI
 springdoc:

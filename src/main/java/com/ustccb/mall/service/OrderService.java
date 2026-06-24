@@ -1,6 +1,8 @@
 package com.ustccb.mall.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ustccb.mall.annotation.Idempotent;
+import com.ustccb.mall.config.RabbitMQConfig;
 import com.ustccb.mall.entity.Goods;
 import com.ustccb.mall.entity.MallOrder;
 import com.ustccb.mall.exception.BizException;
@@ -10,20 +12,20 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 订单服务
- * <ul>
- *   <li>Redisson 分布式锁（RLock）保证同商品并发安全，支持可重入、等待重试和 Watchdog 自动续期</li>
- *   <li>TransactionTemplate 编程式事务：解决 AOP 自调用失效问题，并确保事务在锁释放前提交，防止并发穿透和超卖</li>
- *   <li>@Idempotent 注解：HTTP 层接口幂等防重（header X-Idempotent-Key）</li>
- *   <li>条件 UPDATE 防超卖：UPDATE goods SET stock = stock - ? WHERE id = ? AND stock >= ?</li>
- * </ul>
+ * 订单服务：包含常规同步下单与高性能 Redis Lua + RabbitMQ 异步下单
  */
 @Slf4j
 @Service
@@ -36,14 +38,14 @@ public class OrderService {
     private final OrderMapper orderMapper;
     private final RedissonClient redisson;
     private final TransactionTemplate transactionTemplate;
+    
+    private final StringRedisTemplate redis;
+    private final DefaultRedisScript<Long> seckillStockScript;
+    private final RabbitTemplate rabbitTemplate;
+    private final ObjectMapper objectMapper;
 
     /**
-     * 创建订单
-     *
-     * @param userId    用户 ID
-     * @param goodsId   商品 ID
-     * @param quantity  数量
-     * @return 新订单
+     * 创建订单：常规同步模式（结合 Redisson 锁 + 编程式事务）
      */
     @Idempotent(expireSeconds = 30, message = "请勿重复下单")
     public MallOrder create(Long userId, Long goodsId, Integer quantity) {
@@ -51,11 +53,10 @@ public class OrderService {
         RLock lock = redisson.getLock(lockKey);
 
         try {
-            // 抢分布式锁：最多等待 3 秒，抢到锁后如果不指定 leaseTime，则使用 Redisson Watchdog 自动续期（每 10 秒续期到 30 秒）
-            // 简历亮点：支持等待重试（高并发下防止大批请求一瞬间因为锁冲突全部被拒，提升用户体验）
+            // 最多等待 3 秒获取锁
             boolean locked = lock.tryLock(3, TimeUnit.SECONDS);
             if (!locked) {
-                log.warn("获取分布式锁失败 goodsId={}", goodsId);
+                log.warn("并发获取分布式锁失败 goodsId={}", goodsId);
                 throw new BizException("系统繁忙，请稍后重试");
             }
         } catch (InterruptedException e) {
@@ -64,12 +65,9 @@ public class OrderService {
         }
 
         try {
-            // 使用 TransactionTemplate 编程式事务，确保：
-            // 1. doCreate 逻辑在事务中运行并落库
-            // 2. 事务在 finally 释放分布式锁之前成功提交，避免“锁释放了但事务还没提交，其他请求获取到锁读到旧数据”的经典并发漏洞
+            // 编程式事务：保证 doCreate 原子逻辑成功，并在锁释放前完成 Commit
             return transactionTemplate.execute(status -> doCreate(userId, goodsId, quantity));
         } finally {
-            // 仅释放当前线程持有的锁，防止锁超时释放后误解锁
             if (lock.isHeldByCurrentThread()) {
                 lock.unlock();
                 log.debug("成功释放分布式锁 key={}", lockKey);
@@ -78,18 +76,82 @@ public class OrderService {
     }
 
     /**
-     * 核心下单逻辑：扣减库存与生成订单（由 TransactionTemplate 统一保证事务原子性）
+     * 高并发秒杀下单：高性能异步削峰模式（Redis Lua 预扣减库存 + RabbitMQ 消息队列）
+     */
+    public MallOrder createSeckill(Long userId, Long goodsId, Integer quantity) {
+        String stockKey = "mall:goods:stock:" + goodsId;
+
+        // 1. 调用 Redis Lua 脚本原子性扣减 Redis 缓存中的库存
+        Long result = redis.execute(
+                seckillStockScript,
+                Collections.singletonList(stockKey),
+                String.valueOf(quantity)
+        );
+
+        if (result == null || result == -1L) {
+            // 缓存库存未初始化（懒加载加载）: 从数据库查询真实库存回写至 Redis
+            Goods g = goodsMapper.findById(goodsId);
+            if (g == null) {
+                throw new BizException("商品不存在");
+            }
+            redis.opsForValue().setIfAbsent(stockKey, String.valueOf(g.getStock()), Duration.ofHours(2));
+            // 重新尝试扣减
+            result = redis.execute(seckillStockScript, Collections.singletonList(stockKey), String.valueOf(quantity));
+        }
+
+        if (result == null || result == 0L) {
+            throw new BizException("库存不足，秒杀已结束");
+        }
+
+        // 2. 预减库存成功，异步向 RabbitMQ 发送下单通知 (MQ 削峰填谷)
+        // 生成全局唯一的消费端幂等主键 Key
+        String idempotentKey = System.currentTimeMillis() + ":" + userId + ":" + goodsId;
+        
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("userId", userId);
+        payload.put("goodsId", goodsId);
+        payload.put("quantity", quantity);
+        payload.put("idempotentKey", idempotentKey);
+
+        try {
+            String jsonMessage = objectMapper.writeValueAsString(payload);
+            // 投递消息至 RabbitMQ 交换机
+            rabbitTemplate.convertAndSend(
+                    RabbitMQConfig.ORDER_EXCHANGE,
+                    RabbitMQConfig.ORDER_ROUTING_KEY,
+                    jsonMessage
+            );
+            log.info("[Seckill Engine] 消息成功投递至 MQ: key={}", idempotentKey);
+        } catch (Exception e) {
+            log.error("[Seckill Engine] MQ 异步消息投递异常，执行 Redis 库存回滚补偿. key={}", idempotentKey, e);
+            // 出现消息投递失败时，主动把 Redis 预扣除的库存回滚（高可靠一致性闭环）
+            redis.opsForValue().increment(stockKey, quantity);
+            throw new BizException("服务器繁忙，请稍后再试");
+        }
+
+        // 3. 快速响应客户端，返回一个 "PENDING" (处理中) 的占位订单对象，供前端轮询查询真实订单状态
+        MallOrder mockOrder = new MallOrder();
+        mockOrder.setId(-1L); // 特殊标记 ID，表示处于 MQ 异步处理队列中
+        mockOrder.setUserId(userId);
+        mockOrder.setGoodsId(goodsId);
+        mockOrder.setQuantity(quantity);
+        mockOrder.setStatus("PENDING");
+        return mockOrder;
+    }
+
+    /**
+     * 核心落库方法：执行实际扣减数据库库存和创建订单 (普通下单/异步消费者均共用此底层方法)
      */
     public MallOrder doCreate(Long userId, Long goodsId, Integer quantity) {
-        // 1. 条件 UPDATE 扣减库存，利用底层数据库行锁防超卖
+        // 利用底层 H2/MySQL 的数据库行级排他锁 + 行库存字段乐观校验，进行数据库防超卖
         int rows = goodsMapper.decreaseStock(goodsId, quantity);
         if (rows == 0) {
             throw new BizException("库存不足");
         }
-        // 2. 算金额
+        
         Goods g = goodsMapper.findById(goodsId);
         BigDecimal amount = g.getPrice().multiply(BigDecimal.valueOf(quantity));
-        // 3. 落单
+
         MallOrder o = new MallOrder();
         o.setUserId(userId);
         o.setGoodsId(goodsId);
@@ -97,7 +159,7 @@ public class OrderService {
         o.setAmount(amount);
         o.setStatus("PENDING");
         orderMapper.insert(o);
-        log.info("下单成功 orderId={} userId={} goodsId={} qty={}", o.getId(), userId, goodsId, quantity);
+        log.info("[DB Order] 数据库落库成功: orderId={}, goodsId={}", o.getId(), goodsId);
         return o;
     }
 
@@ -106,4 +168,3 @@ public class OrderService {
         return orderMapper.findById(id);
     }
 }
-

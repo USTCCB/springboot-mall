@@ -1,5 +1,6 @@
 package com.ustccb.mall.controller;
 
+import com.ustccb.mall.annotation.RateLimit;
 import com.ustccb.mall.entity.MallOrder;
 import com.ustccb.mall.service.OrderService;
 import io.swagger.v3.oas.annotations.Operation;
@@ -10,7 +11,6 @@ import org.springframework.web.bind.annotation.*;
 
 /**
  * 订单接口
- * <p>POST /api/orders 自动启用接口幂等：请求需带 X-Idempotent-Key header，30 秒内重复请求被拒。</p>
  */
 @Tag(name = "订单接口")
 @RestController
@@ -20,13 +20,28 @@ public class OrderController {
 
     private final OrderService orderService;
 
-    @Operation(summary = "创建订单（幂等）")
+    @Operation(summary = "创建订单（同步常规模式）")
     @PostMapping
     public MallOrder create(
             @Parameter(description = "用户 ID") @RequestParam Long userId,
             @Parameter(description = "商品 ID") @RequestParam Long goodsId,
             @Parameter(description = "数量")     @RequestParam Integer quantity) {
         return orderService.create(userId, goodsId, quantity);
+    }
+
+    /**
+     * 高并发秒杀抢购入口：
+     * 1. 采用 @RateLimit 分布式令牌桶限流，QPS为2，限制单用户对单个商品的瞬时频繁点击
+     * 2. 内部采用 Redis Lua 库存预扣减 + RabbitMQ 异步落库削峰
+     */
+    @Operation(summary = "创建订单（高并发秒杀异步削峰模式）")
+    @PostMapping("/seckill")
+    @RateLimit(key = "'seckill:' + #goodsId + ':' + #userId", qps = 2.0, capacity = 5.0, message = "秒杀抢购过于火爆，你已被限流，请稍后再试")
+    public MallOrder createSeckill(
+            @Parameter(description = "用户 ID") @RequestParam Long userId,
+            @Parameter(description = "商品 ID") @RequestParam Long goodsId,
+            @Parameter(description = "数量")     @RequestParam Integer quantity) {
+        return orderService.createSeckill(userId, goodsId, quantity);
     }
 
     @Operation(summary = "支付订单")
