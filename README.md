@@ -9,16 +9,16 @@
 
 ## ✨ 核心亮点
 
-| 模块 | 实现 | 解决的问题 |
+| 模块 | 实现 | 解决的痛点 / 简历亮点 |
 |---|---|---|
-| **Cache Aside 缓存** | Redis + Jackson + @Transactional | 商品详情热点读，DB 压力下降 ~90% |
+| **Redisson 分布式锁** | Redisson `RLock` 可重入机制 | 支持等待排队重试、Watchdog 看门狗自动续期，解决业务延迟锁提前释放及单点死锁 |
+| **编程式事务处理** | `TransactionTemplate` 编程式事务 | 修复声明式 AOP 自调用失效 bug；将事务 Commit 锁在释放锁前，杜绝“锁已释放但事务未提交”引发的竞态脏读 |
+| **高安全缓存防护** | Redis Cache Aside + 空值缓存 + DCL 锁 | 缓存空值防止恶意穿透；互斥锁加 **双重检查锁 (DCL)** 优雅处理热点商品失效，防止缓存击穿数据库 |
 | **接口幂等（@Idempotent）** | 自研注解 + AOP + Redis SETNX | 防重复下单、重复支付 |
-| **分布式锁** | Redis SETNX + UUID + Lua CAS 释放 | 多节点下商品并发安全 |
-| **条件 UPDATE 防超卖** | `UPDATE ... WHERE stock >= ?` | 一行 SQL 解决"判断+扣减" |
-| **AOP Web 日志** | traceId + cost 监控 | 统一日志、便于排障 |
-| **Swagger 接口文档** | springdoc-openapi 2.3.0 | /swagger-ui.html 一目了然 |
-| **全局异常处理** | @ControllerAdvice + BizException | 统一返回结构 |
-| **CI** | GitHub Actions | 每次 push 自动 mvn verify |
+| **条件 UPDATE 防超卖** | `UPDATE goods SET stock = stock - ? WHERE id = ? AND stock >= ?` | 一行 SQL 利用数据库行锁解决并发“判断+扣减”，保障库存绝对一致性 |
+| **AOP Web 日志** | traceId + cost 监控 | 统一日志格式，便以生产环境全链路排障 |
+| **Swagger 接口文档** | springdoc-openapi 2.3.0 | 访问 /swagger-ui.html 获取一目了然的 API Docs |
+| **CI/CD 自动化** | GitHub Actions | 每次 Push 代码自动触发 Maven 编译与单测构建校验 |
 
 ## 🚀 快速开始
 
@@ -34,33 +34,35 @@ docker compose up --build
 - 接口文档：<http://localhost:8082/swagger-ui.html>
 - 健康检查：<http://localhost:8082/api/goods>
 
-## 📐 架构
+## 📐 架构时序
 
 ```
-        ┌──────────────┐
-        │   Client     │
-        └──────┬───────┘
-               │  X-Idempotent-Key
-               ▼
-     ┌─────────────────────┐
-     │  IdempotentAspect   │ ──► Redis (SETNX, 30s)
-     └──────────┬──────────┘
-                │
+         ┌──────────────┐
+         │   Client     │
+         └──────┬───────┘
+                │  X-Idempotent-Key
                 ▼
-     ┌─────────────────────┐
-     │ OrderService.create │ ──► Redis (SETNX + UUID, 5s)
-     └──────────┬──────────┘                │
-                ▼                            │ Lua 释放
-     ┌─────────────────────┐                │
-     │ @Transactional      │ ◄──────────────┘
-     │  1. 扣库存 (条件 UPDATE)
-     │  2. 落订单
-     │  3. DEL 缓存
-     └──────────┬──────────┘
-                ▼
-        ┌──────────────┐
-        │   H2 / MySQL │
-        └──────────────┘
+      ┌─────────────────────┐
+      │  IdempotentAspect   │ ──► Redis (SETNX 幂等过滤)
+      └──────────┬──────────┘
+                 │
+                 ▼
+      ┌─────────────────────┐
+      │ OrderService.create │ ──► 获取 Redisson.getLock(lockKey)
+      └──────────┬──────────┘                │
+                 │ 1. tries lock (3s)        │ 锁看门狗自动续期 (Watchdog)
+                 ▼                           │
+      ┌─────────────────────┐                │
+      │ TransactionTemplate │ ◄──────────────┘
+      │  2. 执行 db 扣库存 (条件 UPDATE)
+      │  3. 生成订单数据
+      │  4. 提交数据库事务 (Commit)
+      └──────────┬──────────┘
+                 │
+                 ▼
+      ┌─────────────────────┐
+      │  finally { unlock } │ ──► 检查并释放锁 (lock.unlock)
+      └─────────────────────┘
 ```
 
 ## 📊 性能压测（50 并发 / 200 次下单）

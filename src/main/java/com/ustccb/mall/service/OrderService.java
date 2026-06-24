@@ -8,21 +8,20 @@ import com.ustccb.mall.mapper.GoodsMapper;
 import com.ustccb.mall.mapper.OrderMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
-import java.util.Collections;
-import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 订单服务
  * <ul>
- *   <li>Redis 分布式锁（SETNX + UUID + Lua 释放）保证同商品并发安全</li>
- *   <li>@Idempotent 注解：HTTP 层防重（header X-Idempotent-Key）</li>
- *   <li>@Transactional：订单 + 库存原子性</li>
+ *   <li>Redisson 分布式锁（RLock）保证同商品并发安全，支持可重入、等待重试和 Watchdog 自动续期</li>
+ *   <li>TransactionTemplate 编程式事务：解决 AOP 自调用失效问题，并确保事务在锁释放前提交，防止并发穿透和超卖</li>
+ *   <li>@Idempotent 注解：HTTP 层接口幂等防重（header X-Idempotent-Key）</li>
  *   <li>条件 UPDATE 防超卖：UPDATE goods SET stock = stock - ? WHERE id = ? AND stock >= ?</li>
  * </ul>
  */
@@ -32,18 +31,11 @@ import java.util.UUID;
 public class OrderService {
 
     private static final String LOCK_PREFIX = "mall:order:lock:";
-    private static final long LOCK_TTL_SEC = 5;
-
-    /** Lua: 仅当 value 匹配时才删除（防止误删别人的锁） */
-    private static final String UNLOCK_LUA =
-            "if redis.call('get', KEYS[1]) == ARGV[1] then " +
-            "  return redis.call('del', KEYS[1]) " +
-            "else return 0 end";
 
     private final GoodsMapper goodsMapper;
     private final OrderMapper orderMapper;
-    private final StringRedisTemplate redis;
-    private final DefaultRedisScript<Long> unlockScript;
+    private final RedissonClient redisson;
+    private final TransactionTemplate transactionTemplate;
 
     /**
      * 创建订单
@@ -56,35 +48,48 @@ public class OrderService {
     @Idempotent(expireSeconds = 30, message = "请勿重复下单")
     public MallOrder create(Long userId, Long goodsId, Integer quantity) {
         String lockKey = LOCK_PREFIX + goodsId;
-        String lockVal = UUID.randomUUID().toString();
+        RLock lock = redisson.getLock(lockKey);
 
-        // 1) 抢分布式锁
-        Boolean locked = redis.opsForValue()
-                .setIfAbsent(lockKey, lockVal, java.time.Duration.ofSeconds(LOCK_TTL_SEC));
-        if (!Boolean.TRUE.equals(locked)) {
-            throw new BizException("系统繁忙，请稍后重试");
+        try {
+            // 抢分布式锁：最多等待 3 秒，抢到锁后如果不指定 leaseTime，则使用 Redisson Watchdog 自动续期（每 10 秒续期到 30 秒）
+            // 简历亮点：支持等待重试（高并发下防止大批请求一瞬间因为锁冲突全部被拒，提升用户体验）
+            boolean locked = lock.tryLock(3, TimeUnit.SECONDS);
+            if (!locked) {
+                log.warn("获取分布式锁失败 goodsId={}", goodsId);
+                throw new BizException("系统繁忙，请稍后重试");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BizException("下单请求中断，请稍后重试");
         }
 
         try {
-            return doCreate(userId, goodsId, quantity);
+            // 使用 TransactionTemplate 编程式事务，确保：
+            // 1. doCreate 逻辑在事务中运行并落库
+            // 2. 事务在 finally 释放分布式锁之前成功提交，避免“锁释放了但事务还没提交，其他请求获取到锁读到旧数据”的经典并发漏洞
+            return transactionTemplate.execute(status -> doCreate(userId, goodsId, quantity));
         } finally {
-            // 2) Lua 释放（仅自己持有时才删）
-            Long released = redis.execute(unlockScript, Collections.singletonList(lockKey), lockVal);
-            log.debug("释放分布式锁 key={} result={}", lockKey, released);
+            // 仅释放当前线程持有的锁，防止锁超时释放后误解锁
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+                log.debug("成功释放分布式锁 key={}", lockKey);
+            }
         }
     }
 
-    @Transactional(rollbackFor = Exception.class)
-    protected MallOrder doCreate(Long userId, Long goodsId, Integer quantity) {
-        // 3) 条件 UPDATE 扣库存（防超卖）
+    /**
+     * 核心下单逻辑：扣减库存与生成订单（由 TransactionTemplate 统一保证事务原子性）
+     */
+    public MallOrder doCreate(Long userId, Long goodsId, Integer quantity) {
+        // 1. 条件 UPDATE 扣减库存，利用底层数据库行锁防超卖
         int rows = goodsMapper.decreaseStock(goodsId, quantity);
         if (rows == 0) {
             throw new BizException("库存不足");
         }
-        // 4) 算金额
+        // 2. 算金额
         Goods g = goodsMapper.findById(goodsId);
         BigDecimal amount = g.getPrice().multiply(BigDecimal.valueOf(quantity));
-        // 5) 落单
+        // 3. 落单
         MallOrder o = new MallOrder();
         o.setUserId(userId);
         o.setGoodsId(goodsId);
@@ -101,3 +106,4 @@ public class OrderService {
         return orderMapper.findById(id);
     }
 }
+
