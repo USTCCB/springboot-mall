@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import static org.junit.jupiter.api.Assertions.*;
 @SpringBootTest
+@org.springframework.test.context.ActiveProfiles("test")
 class MallApplicationTests {
     @Autowired GoodsService goodsService;
     @Autowired OrderService orderService;

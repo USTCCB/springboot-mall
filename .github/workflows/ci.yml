@@ -10,6 +10,17 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,11 +35,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.m2
-          key: ${{ runner.os }}-m2-${{ hashFiles(**/pom.xml) }}
+          key: ${{ runner.os }}-m2-${{ hashFiles("**/pom.xml") }}
           restore-keys: ${{ runner.os }}-m2-
 
       - name: Compile
         run: mvn -B clean compile
+
+      - name: Run tests
+        run: mvn -B test
 
       - name: Package
         run: mvn -B package -DskipTests

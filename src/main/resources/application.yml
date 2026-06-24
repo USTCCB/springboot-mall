@@ -19,3 +19,11 @@ spring:
 mybatis:
   mapper-locations: classpath:mapper/*.xml
   type-aliases-package: com.ustccb.mall.entity
+
+# SpringDoc OpenAPI
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: alpha

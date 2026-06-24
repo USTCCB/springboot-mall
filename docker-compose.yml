@@ -1,0 +1,13 @@
+version: "3.8"
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: mall-redis
+    ports: ["6379:6379"]
+  mall:
+    build: .
+    container_name: mall-app
+    depends_on: [redis]
+    environment:
+      SPRING_DATA_REDIS_HOST: redis
+    ports: ["8082:8082"]
