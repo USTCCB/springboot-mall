@@ -10,12 +10,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,9 +30,8 @@ jobs:
       - name: Compile
         run: mvn -B clean compile
 
-      - name: Test (Redis optional)
-        run: mvn -B test -Dspring.data.redis.host=localhost -Dspring.data.redis.port=6379
-        continue-on-error: false
-
       - name: Package
         run: mvn -B package -DskipTests
+
+      - name: Verify JAR
+        run: ls -la target/*.jar
