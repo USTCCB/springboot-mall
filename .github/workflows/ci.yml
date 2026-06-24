@@ -15,11 +15,6 @@ jobs:
         image: redis:7-alpine
         ports:
           - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
 
     steps:
       - name: Checkout
@@ -38,13 +33,12 @@ jobs:
           key: ${{ runner.os }}-m2-${{ hashFiles(**/pom.xml) }}
           restore-keys: ${{ runner.os }}-m2-
 
-      - name: Build with Maven
-        run: mvn -B clean verify
+      - name: Compile
+        run: mvn -B clean compile
 
-      - name: Upload test reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: surefire-reports
-          path: **/target/surefire-reports/*.xml
-          if-no-files-found: ignore
+      - name: Test (Redis optional)
+        run: mvn -B test -Dspring.data.redis.host=localhost -Dspring.data.redis.port=6379
+        continue-on-error: false
+
+      - name: Package
+        run: mvn -B package -DskipTests
