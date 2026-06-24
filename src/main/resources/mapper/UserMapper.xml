@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.ustccb.mall.mapper.UserMapper">
+    <resultMap id="BaseMap" type="com.ustccb.mall.entity.UserAccount">
+        <id property="id" column="id"/>
+        <result property="username" column="username"/>
+        <result property="password" column="password"/>
+        <result property="createdAt" column="created_at"/>
+    </resultMap>
+    <select id="findByUsername" resultMap="BaseMap">SELECT * FROM user_account WHERE username = #{username}</select>
+</mapper>
